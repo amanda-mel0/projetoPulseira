@@ -1,0 +1,305 @@
+import network
+import socket
+import json
+import time
+from machine import Pin, PWM
+import _thread
+
+class NavigationBracelet:
+    def __init__(self):
+        # Configuração dos pinos
+        self.buzzer = PWM(Pin(18))  # Pino do buzzer
+        self.vibra_call = PWM(Pin(19))  # Pino do VibraCall
+        
+        # Configurações de rede
+        self.wifi_ssid = "SUA_REDE_WIFI"
+        self.wifi_password = "SUA_SENHA_WIFI"
+        self.server_host = "192.168.1.100"  # IP do servidor
+        self.server_port = 8080
+        
+        # Estado do sistema
+        self.connected = False
+        self.obstacle_data = None
+        self.alert_active = False
+        
+        # Configurações de alerta
+        self.min_distance = 2.0  # Distância mínima para alerta (metros)
+        self.buzzer_freq = 1000  # Frequência do buzzer em Hz
+        self.vibra_max_duty = 1023  # Máxima intensidade de vibração
+        
+    def connect_wifi(self):
+        """Conecta à rede Wi-Fi"""
+        wlan = network.WLAN(network.STA_IF)
+        wlan.active(True)
+        
+        if not wlan.isconnected():
+            print("Conectando ao Wi-Fi...")
+            wlan.connect(self.wifi_ssid, self.wifi_password)
+            
+            # Aguarda conexão
+            timeout = 10
+            while not wlan.isconnected() and timeout > 0:
+                time.sleep(1)
+                timeout -= 1
+                print(".", end="")
+            
+            if wlan.isconnected():
+                print(f"\nConectado! IP: {wlan.ifconfig()[0]}")
+                self.connected = True
+                return True
+            else:
+                print("\nFalha na conexão Wi-Fi")
+                return False
+        else:
+            print("Já conectado ao Wi-Fi")
+            self.connected = True
+            return True
+    
+    def connect_server(self):
+        """Estabelece conexão com o servidor"""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.connect((self.server_host, self.server_port))
+            print(f"Conectado ao servidor {self.server_host}:{self.server_port}")
+            return True
+        except Exception as e:
+            print(f"Erro ao conectar ao servidor: {e}")
+            return False
+    
+    def receive_data(self):
+        """Thread para receber dados do servidor continuamente"""
+        while self.connected:
+            try:
+                # Recebe dados do servidor
+                data = self.socket.recv(1024)
+                if data:
+                    # Decodifica dados JSON
+                    obstacle_info = json.loads(data.decode('utf-8'))
+                    self.process_obstacle_data(obstacle_info)
+                else:
+                    print("Conexão perdida com o servidor")
+                    break
+                    
+            except Exception as e:
+                print(f"Erro ao receber dados: {e}")
+                time.sleep(1)
+    
+    def process_obstacle_data(self, data):
+        """Processa dados de obstáculos recebidos do servidor"""
+        try:
+            # Estrutura esperada dos dados:
+            # {
+            #     "obstacle_detected": True/False,
+            #     "distance": float,
+            #     "obstacle_type": "unknown",
+            #     "position": {"x": float, "y": float}
+            # }
+            
+            self.obstacle_data = data
+            
+            if data.get("obstacle_detected", False):
+                distance = data.get("distance", float('inf'))
+                
+                if distance <= self.min_distance:
+                    print(f"Obstáculo detectado a {distance:.2f}m")
+                    self.trigger_alert(distance)
+                else:
+                    self.stop_alert()
+            else:
+                self.stop_alert()
+                
+        except Exception as e:
+            print(f"Erro ao processar dados: {e}")
+    
+    def trigger_alert(self, distance):
+        """Aciona os alertas baseado na distância"""
+        if not self.alert_active:
+            self.alert_active = True
+            
+            # Aciona buzzer com 2 bips longos
+            self.buzzer_alert()
+            
+        # Calcula intensidade de vibração baseada na distância
+        # Quanto mais próximo, maior a intensidade
+        if distance > 0:
+            # Normaliza distância (0-2m) para intensidade (0-1023)
+            intensity = int(self.vibra_max_duty * (1 - (distance / self.min_distance)))
+            intensity = max(0, min(intensity, self.vibra_max_duty))
+            self.vibrate(intensity)
+        
+    def buzzer_alert(self):
+        """Emite 2 bips longos no buzzer"""
+        def buzzer_sequence():
+            for i in range(2):  # 2 bips
+                self.buzzer.freq(self.buzzer_freq)
+                self.buzzer.duty(512)  # 50% duty cycle
+                time.sleep(0.8)  # Bip longo (800ms)
+                
+                self.buzzer.duty(0)  # Desliga
+                time.sleep(0.3)  # Pausa entre bips
+            
+            self.buzzer.deinit()  # Desliga completamente
+        
+        # Executa sequência em thread separada para não bloquear
+        _thread.start_new_thread(buzzer_sequence, ())
+    
+    def vibrate(self, intensity):
+        """Controla a vibração com intensidade variável"""
+        if intensity > 0:
+            self.vibra_call.freq(200)  # Frequência da vibração
+            self.vibra_call.duty(intensity)
+        else:
+            self.vibra_call.duty(0)
+    
+    def stop_alert(self):
+        """Para todos os alertas"""
+        if self.alert_active:
+            self.alert_active = False
+            
+            # Para vibração
+            self.vibra_call.duty(0)
+            
+            # Para buzzer (se ainda estiver tocando)
+            self.buzzer.duty(0)
+            
+            print("Alerta desativado")
+    
+    def send_status(self, status):
+        """Envia status de volta ao servidor"""
+        try:
+            status_data = {
+                "device_id": "bracelet_001",
+                "status": status,
+                "timestamp": time.time(),
+                "battery_level": self.get_battery_level()
+            }
+            
+            message = json.dumps(status_data).encode('utf-8')
+            self.socket.send(message)
+            
+        except Exception as e:
+            print(f"Erro ao enviar status: {e}")
+    
+    def get_battery_level(self):
+        """Simula leitura do nível da bateria"""
+        # Aqui você implementaria a leitura real da bateria
+        # Por exemplo, usando ADC para ler tensão da bateria
+        from machine import ADC
+        
+        # Exemplo com ADC (ajuste conforme seu circuito)
+        # adc = ADC(Pin(34))
+        # voltage = (adc.read() / 4095.0) * 3.3
+        # battery_percent = ((voltage - 3.0) / (4.2 - 3.0)) * 100
+        
+        # Por enquanto, retorna valor simulado
+        return 85  # 85% de bateria
+    
+    def run(self):
+        """Função principal do sistema"""
+        print("=== Sistema de Pulseira de Navegação Assistiva ===")
+        
+        # Conecta ao Wi-Fi
+        if not self.connect_wifi():
+            print("Erro: Não foi possível conectar ao Wi-Fi")
+            return
+        
+        # Conecta ao servidor
+        if not self.connect_server():
+            print("Erro: Não foi possível conectar ao servidor")
+            return
+        
+        # Envia status inicial
+        self.send_status("connected")
+        
+        # Inicia thread para receber dados
+        _thread.start_new_thread(self.receive_data, ())
+        
+        print("Sistema iniciado. Aguardando dados do servidor...")
+        
+        # Loop principal
+        try:
+            while self.connected:
+                # Monitora sistema e envia status periodicamente
+                time.sleep(30)  # Envia status a cada 30 segundos
+                self.send_status("active")
+                
+        except KeyboardInterrupt:
+            print("\nSistema interrompido pelo usuário")
+        except Exception as e:
+            print(f"Erro no loop principal: {e}")
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """Limpeza ao encerrar o sistema"""
+        print("Encerrando sistema...")
+        
+        self.stop_alert()
+        self.connected = False
+        
+        try:
+            self.socket.close()
+        except:
+            pass
+        
+        # Libera recursos PWM
+        try:
+            self.buzzer.deinit()
+            self.vibra_call.deinit()
+        except:
+            pass
+        
+        print("Sistema encerrado")
+
+# Exemplo de uso e configuração
+def main():
+    """Função principal para iniciar o sistema"""
+    
+    # Cria instância da pulseira
+    bracelet = NavigationBracelet()
+    
+    # Configurações personalizáveis
+    bracelet.wifi_ssid = "SUA_REDE_WIFI"           # Substitua pela sua rede
+    bracelet.wifi_password = "SUA_SENHA_WIFI"       # Substitua pela sua senha
+    bracelet.server_host = "192.168.1.100"         # IP do seu servidor
+    bracelet.server_port = 8080                     # Porta do seu servidor
+    
+    # Inicia o sistema
+    bracelet.run()
+
+# Exemplo de teste local (sem servidor)
+def test_alerts():
+    """Função para testar os alertas localmente"""
+    bracelet = NavigationBracelet()
+    
+    print("Testando alertas...")
+    
+    # Simula obstáculo a 1.5m
+    test_data = {
+        "obstacle_detected": True,
+        "distance": 1.5,
+        "obstacle_type": "unknown",
+        "position": {"x": 10.5, "y": 5.2}
+    }
+    
+    bracelet.process_obstacle_data(test_data)
+    time.sleep(3)
+    
+    # Simula obstáculo mais próximo (0.5m)
+    test_data["distance"] = 0.5
+    bracelet.process_obstacle_data(test_data)
+    time.sleep(3)
+    
+    # Para alerta
+    test_data["obstacle_detected"] = False
+    bracelet.process_obstacle_data(test_data)
+    
+    bracelet.cleanup()
+
+# Execução
+if __name__ == "__main__":
+    # Para uso normal:
+    main()
+    
+    # Para teste local:
+    # test_alerts()
